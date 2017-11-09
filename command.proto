@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+// protoc --go_out=. *.proto
+
+package schemastore;
+
+message Message {
+	uint32 op  = 1;
+	string key = 2;
+	uint64 ts  = 3;
+	bytes msg  = 4;
+}
