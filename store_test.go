@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+var env = "test"
+
 func TestNewStore(t *testing.T) {
 	s := New()
 	tmpDir, _ := ioutil.TempDir("", "store_test")
@@ -18,7 +20,7 @@ func TestNewStore(t *testing.T) {
 	s.RaftDir = tmpDir
 
 	allowSingle := false
-	err := s.Open(allowSingle, "node0")
+	err := s.Open(env, allowSingle, "node0")
 	assert.Equal(t, nil, err)
 }
 
@@ -33,7 +35,7 @@ func TestSingleNodeSchemaStore(t *testing.T) {
 		t.Fatalf("failed to create store")
 	}
 
-	if err := s.Open(true, "node0"); err != nil {
+	if err := s.Open(env, true, "node0"); err != nil {
 		t.Fatalf("failed to open store: %s", err)
 	}
 

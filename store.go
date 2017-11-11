@@ -6,15 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
+	"go.uber.org/zap"
 )
 
 const (
@@ -22,39 +23,64 @@ const (
 	raftTimeout         = 10 * time.Second
 )
 
-type command struct {
-	Op    string `json:"op,omitempty"`
-	Key   string `json:"key,omitempty"`
-	Value string `json:"value,omitempty"`
-}
+var (
+	// Ensure Store implements raft.FSM
+	_ raft.FSM = (*Store)(nil)
+)
 
-// Store is a simple key-value store, where all changes are made via Raft consensus.
+// Store is a schema applyer store that allows cross-node schema
+// consensus and replication.  Schema is synced via Raft consensus.
 type Store struct {
 	RaftDir  string
 	RaftBind string
-
-	mu sync.Mutex
-	m  map[string]string // The key-value store for the system.
-
-	raft *raft.Raft // The consensus mechanism
-
-	logger *log.Logger
+	mu       sync.Mutex
+	m        map[string]string // The key-value store for the system.
+	raft     *raft.Raft        // raft consensus/coordination
+	log      *zap.SugaredLogger
 }
 
 // New returns a new Store.
 func New() *Store {
 	return &Store{
-		m:      make(map[string]string),
-		logger: log.New(os.Stderr, "[store] ", log.LstdFlags),
+		m: make(map[string]string),
 	}
 }
 
 // Open opens the store. If enableSingle is set, and there are no existing peers,
 // then this node becomes the first node, and therefore leader, of the cluster.
 // localID should be the server identifier for this node.
-func (s *Store) Open(enableSingle bool, localID string) error {
+func (s *Store) Open(env string, enableSingle bool, localID string) error {
+
+	// Using zap's preset constructors is the simplest way to get a feel for the
+	// package, but they don't allow much customization.
+	var err error
+	var logger *zap.Logger
+	switch env {
+	case "", "dev", "development", "test":
+		logger, err = zap.NewDevelopment()
+	case "prod":
+		logger, err = zap.NewProduction()
+	case "example":
+		logger = zap.NewExample()
+	}
+	if err != nil {
+		return err
+	}
+
+	// Lets redirect standard logs
+	stdLog := zap.NewStdLog(logger)
+
+	s.log = logger.Sugar()
+	s.log.Infow("failed to fetch URL",
+		"url", "http://example.com",
+		"attempt", 3,
+		"backoff", time.Second,
+	)
+	s.log.Debugf("failed to fetch URL: %s", "http://example.com")
+
 	// Setup Raft configuration.
 	config := raft.DefaultConfig()
+	config.Logger = stdLog
 	config.LocalID = raft.ServerID(localID)
 
 	// Setup Raft communication.
@@ -80,7 +106,7 @@ func (s *Store) Open(enableSingle bool, localID string) error {
 	}
 
 	// Instantiate the Raft systems.
-	ra, err := raft.NewRaft(config, (*fsm)(s), logStore, logStore, snapshots, transport)
+	ra, err := raft.NewRaft(config, s, logStore, logStore, snapshots, transport)
 	if err != nil {
 		return fmt.Errorf("new raft: %s", err)
 	}
@@ -101,6 +127,12 @@ func (s *Store) Open(enableSingle bool, localID string) error {
 	return nil
 }
 
+// Close closes the schema sync
+func (s *Store) Close() error {
+	s.log.Sync()
+	return nil
+}
+
 // Get returns the value for the given key.
 func (s *Store) Get(key string) (string, error) {
 	s.mu.Lock()
@@ -114,17 +146,16 @@ func (s *Store) Set(key, value string) error {
 		return fmt.Errorf("not leader")
 	}
 
-	c := &command{
-		Op:    "set",
-		Key:   key,
-		Value: value,
+	m := &Message{
+		Op:  "set",
+		Key: key,
+		Msg: []byte(value),
 	}
-	b, err := json.Marshal(c)
+	by, err := proto.Marshal(m)
 	if err != nil {
 		return err
 	}
-
-	f := s.raft.Apply(b, raftTimeout)
+	f := s.raft.Apply(by, raftTimeout)
 	return f.Error()
 }
 
@@ -134,66 +165,66 @@ func (s *Store) Delete(key string) error {
 		return fmt.Errorf("not leader")
 	}
 
-	c := &command{
+	m := &Message{
 		Op:  "delete",
 		Key: key,
 	}
-	b, err := json.Marshal(c)
+	by, err := proto.Marshal(m)
 	if err != nil {
 		return err
 	}
 
-	f := s.raft.Apply(b, raftTimeout)
+	f := s.raft.Apply(by, raftTimeout)
 	return f.Error()
 }
 
 // Join joins a node, identified by nodeID and located at addr, to this store.
 // The node must be ready to respond to Raft communications at that address.
 func (s *Store) Join(nodeID, addr string) error {
-	s.logger.Printf("received join request for remote node as %s", addr)
+	s.log.Debugf("received join request for remote node as %s", addr)
 
 	f := s.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, 0)
 	if f.Error() != nil {
 		return f.Error()
 	}
-	s.logger.Printf("node at %s joined successfully", addr)
+	s.log.Infof("node at %s joined successfully", addr)
 	return nil
 }
 
-type fsm Store
+// -- raft.FSM implementation
 
 // Apply applies a Raft log entry to the key-value store.
-func (f *fsm) Apply(l *raft.Log) interface{} {
-	var c command
-	if err := json.Unmarshal(l.Data, &c); err != nil {
+func (s *Store) Apply(l *raft.Log) interface{} {
+	var msg Message
+	if err := proto.Unmarshal(l.Data, &msg); err != nil {
 		panic(fmt.Sprintf("failed to unmarshal command: %s", err.Error()))
 	}
 
-	switch c.Op {
+	switch msg.Op {
 	case "set":
-		return f.applySet(c.Key, c.Value)
+		return s.applySet(msg.Key, string(msg.Msg))
 	case "delete":
-		return f.applyDelete(c.Key)
+		return s.applyDelete(msg.Key)
 	default:
-		panic(fmt.Sprintf("unrecognized command op: %s", c.Op))
+		panic(fmt.Sprintf("unrecognized command op: %s", msg.Op))
 	}
 }
 
 // Snapshot returns a snapshot of the key-value store.
-func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	// Clone the map.
 	o := make(map[string]string)
-	for k, v := range f.m {
+	for k, v := range s.m {
 		o[k] = v
 	}
 	return &fsmSnapshot{store: o}, nil
 }
 
 // Restore stores the key-value store to a previous state.
-func (f *fsm) Restore(rc io.ReadCloser) error {
+func (s *Store) Restore(rc io.ReadCloser) error {
 	o := make(map[string]string)
 	if err := json.NewDecoder(rc).Decode(&o); err != nil {
 		return err
@@ -201,21 +232,21 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 
 	// Set the state from the snapshot, no lock required according to
 	// Hashicorp docs.
-	f.m = o
+	s.m = o
 	return nil
 }
 
-func (f *fsm) applySet(key, value string) interface{} {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.m[key] = value
+func (s *Store) applySet(key, value string) interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m[key] = value
 	return nil
 }
 
-func (f *fsm) applyDelete(key string) interface{} {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.m, key)
+func (s *Store) applyDelete(key string) interface{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, key)
 	return nil
 }
 
